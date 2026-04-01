@@ -142,8 +142,41 @@ class CLOBRestClient:
 
     # -- convenience helpers --------------------------------------------------
 
-    async def get_markets(self) -> list[dict]:
-        return await self.request("GET", "/markets")
+    async def get_markets(self, tag: Optional[str] = None, active: bool = True, max_pages: int = 20) -> list[dict]:
+        """Fetch markets with cursor-based pagination.
+
+        Args:
+            tag: Filter by tag (e.g. "crypto").
+            active: Only return active markets.
+            max_pages: Safety limit on pages to fetch.
+        """
+        all_markets: list[dict] = []
+        cursor = None
+
+        for _ in range(max_pages):
+            params: dict[str, str] = {}
+            if tag:
+                params["tag"] = tag
+            if active:
+                params["active"] = "true"
+            if cursor:
+                params["next_cursor"] = cursor
+
+            resp = await self.request("GET", "/markets", params=params)
+
+            if isinstance(resp, dict):
+                data = resp.get("data") or []
+                all_markets.extend(d for d in data if isinstance(d, dict))
+                cursor = resp.get("next_cursor")
+                if not cursor or not data:
+                    break
+            elif isinstance(resp, list):
+                all_markets.extend(resp)
+                break
+            else:
+                break
+
+        return all_markets
 
     async def get_market(self, condition_id: str) -> dict:
         return await self.request("GET", f"/markets/{condition_id}")
