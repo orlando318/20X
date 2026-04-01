@@ -93,22 +93,81 @@ def build_weekly_slugs(coin: Coin, week_start: datetime) -> list[str]:
 
 
 def build_short_duration_slugs(coin: Coin, duration: Duration, end_timestamp: int) -> list[str]:
-    """Generate slugs for 5m/15m/1h/4h markets.
+    """Generate slugs for 5m/15m/4h markets (timestamp-based).
 
     Examples:
         btc-updown-5m-1775055900
-        eth-updown-15m-1775055900
+        eth-updown-15m-1775057400
+        btc-updown-4h-1775059200
     """
     short = _COIN_SHORT[coin]
     dur_tag = {
         Duration.MIN_5: "5m",
         Duration.MIN_15: "15m",
-        Duration.HOUR_1: "1h",
         Duration.HOUR_4: "4h",
     }.get(duration)
     if dur_tag is None:
         return []
     return [f"{short}-updown-{dur_tag}-{end_timestamp}"]
+
+
+def _format_hour(hour_24: int) -> str:
+    """Convert 24h hour to Polymarket format: 9am, 10am, 12pm, 1pm, etc."""
+    if hour_24 == 0:
+        return "12am"
+    elif hour_24 < 12:
+        return f"{hour_24}am"
+    elif hour_24 == 12:
+        return "12pm"
+    else:
+        return f"{hour_24 - 12}pm"
+
+
+def build_hourly_slugs(coin: Coin, date: datetime, hour_et: int) -> list[str]:
+    """Generate slugs for 1-hour markets.
+
+    Pattern: {name}-up-or-down-{month}-{day}-{year}-{hour}-et
+    Example: bitcoin-up-or-down-april-1-2026-11am-et
+
+    Args:
+        hour_et: Hour in ET (Eastern Time), 0-23.
+    """
+    name = _COIN_SLUG[coin]
+    month = _MONTH_NAMES[date.month]
+    day = date.day
+    year = date.year
+    h = _format_hour(hour_et)
+    return [
+        f"{name}-up-or-down-{month}-{day}-{year}-{h}-et",
+        f"{name}-up-or-down-{month}-{day}-{h}-et",
+    ]
+
+
+def build_monthly_slugs(coin: Coin, month: int, year: int) -> list[str]:
+    """Generate slugs for monthly markets.
+
+    Pattern: what-price-will-{name}-hit-in-{month}
+    Example: what-price-will-bitcoin-hit-in-april
+    """
+    name = _COIN_SLUG[coin]
+    m = _MONTH_NAMES[month]
+    return [
+        f"what-price-will-{name}-hit-in-{m}",
+        f"what-price-will-{name}-hit-in-{m}-{year}",
+    ]
+
+
+def build_yearly_slugs(coin: Coin, year: int) -> list[str]:
+    """Generate slugs for yearly markets.
+
+    Pattern: what-price-will-{name}-hit-before-{year+1}
+    Example: what-price-will-bitcoin-hit-before-2027
+    """
+    name = _COIN_SLUG[coin]
+    return [
+        f"what-price-will-{name}-hit-before-{year + 1}",
+        f"what-price-will-{name}-hit-in-{year}",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -433,21 +492,70 @@ class CryptoMarketSelector:
             try_events=True,
         )
 
-    async def fetch_short_duration(
-        self, coins: list[Coin], duration: Duration, end_timestamp: int
-    ) -> list[CryptoMarket]:
-        """Fetch 5m/15m/1h/4h markets by end timestamp."""
+    async def fetch_5m(self, coins: list[Coin], end_timestamp: int) -> list[CryptoMarket]:
+        """Fetch 5-minute markets by end timestamp (unix seconds)."""
         return await self._fetch_by_slugs(
-            {coin: build_short_duration_slugs(coin, duration, end_timestamp) for coin in coins},
-            duration,
+            {coin: build_short_duration_slugs(coin, Duration.MIN_5, end_timestamp) for coin in coins},
+            Duration.MIN_5,
+        )
+
+    async def fetch_15m(self, coins: list[Coin], end_timestamp: int) -> list[CryptoMarket]:
+        """Fetch 15-minute markets by end timestamp (unix seconds)."""
+        return await self._fetch_by_slugs(
+            {coin: build_short_duration_slugs(coin, Duration.MIN_15, end_timestamp) for coin in coins},
+            Duration.MIN_15,
+        )
+
+    async def fetch_1h(self, coins: list[Coin], date: Optional[datetime] = None, hour_et: Optional[int] = None) -> list[CryptoMarket]:
+        """Fetch 1-hour markets.
+
+        Args:
+            date: Date of the market (default: today).
+            hour_et: Hour in Eastern Time, 0-23 (default: current hour ET).
+        """
+        date = date or datetime.utcnow()
+        if hour_et is None:
+            # Approximate: UTC-4 for EDT, UTC-5 for EST
+            hour_et = (datetime.utcnow().hour - 4) % 24
+        return await self._fetch_by_slugs(
+            {coin: build_hourly_slugs(coin, date, hour_et) for coin in coins},
+            Duration.HOUR_1,
+        )
+
+    async def fetch_4h(self, coins: list[Coin], end_timestamp: int) -> list[CryptoMarket]:
+        """Fetch 4-hour markets by end timestamp (unix seconds)."""
+        return await self._fetch_by_slugs(
+            {coin: build_short_duration_slugs(coin, Duration.HOUR_4, end_timestamp) for coin in coins},
+            Duration.HOUR_4,
+        )
+
+    async def fetch_monthly(self, coins: list[Coin], month: Optional[int] = None, year: Optional[int] = None) -> list[CryptoMarket]:
+        """Fetch monthly markets (default: current month)."""
+        now = datetime.utcnow()
+        month = month or now.month
+        year = year or now.year
+        return await self._fetch_by_slugs(
+            {coin: build_monthly_slugs(coin, month, year) for coin in coins},
+            Duration.MONTHLY,
+            try_events=True,
+        )
+
+    async def fetch_yearly(self, coins: list[Coin], year: Optional[int] = None) -> list[CryptoMarket]:
+        """Fetch yearly markets (default: current year)."""
+        year = year or datetime.utcnow().year
+        return await self._fetch_by_slugs(
+            {coin: build_yearly_slugs(coin, year) for coin in coins},
+            Duration.YEARLY,
+            try_events=True,
         )
 
     async def fetch_all_active(self, coins: Optional[list[Coin]] = None) -> list[CryptoMarket]:
-        """Fetch daily + weekly markets for given coins (default: BTC, ETH, SOL)."""
+        """Fetch daily + weekly + monthly markets for given coins."""
         coins = coins or [Coin.BTC, Coin.ETH, Coin.SOL]
         daily = await self.fetch_daily(coins)
         weekly = await self.fetch_weekly(coins)
-        self._markets = daily + weekly
+        monthly = await self.fetch_monthly(coins)
+        self._markets = daily + weekly + monthly
         return self._markets
 
     # -- Filters --------------------------------------------------------------

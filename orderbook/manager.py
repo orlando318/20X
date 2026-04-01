@@ -11,6 +11,25 @@ from models.orderbook import OrderBook, PriceLevel, Side
 logger = logging.getLogger(__name__)
 
 
+def _parse_book_levels(raw_levels: list) -> list[list[float]]:
+    """Parse book levels from CLOB API — handles both dict and list formats."""
+    result = []
+    for level in raw_levels:
+        parsed = _parse_book_level(level)
+        if parsed:
+            result.append(parsed)
+    return result
+
+
+def _parse_book_level(level) -> Optional[list[float]]:
+    """Parse a single book level — dict or list/tuple."""
+    if isinstance(level, dict):
+        return [float(level["price"]), float(level["size"])]
+    elif isinstance(level, (list, tuple)) and len(level) >= 2:
+        return [float(level[0]), float(level[1])]
+    return None
+
+
 class OrderBookManager:
     """Manages local order book state for one or more tokens.
 
@@ -62,10 +81,11 @@ class OrderBookManager:
         self._syncing.add(token_id)
         try:
             data = await self._rest.get_order_book(token_id)
-            bids = [[float(p), float(s)] for p, s in (data.get("bids") or [])]
-            asks = [[float(p), float(s)] for p, s in (data.get("asks") or [])]
-            seq = int(data.get("hash", data.get("sequence", 0)) or 0)
+            bids = _parse_book_levels(data.get("bids") or [])
+            asks = _parse_book_levels(data.get("asks") or [])
             ts = int(data.get("timestamp", 0) or 0)
+            # CLOB hash is hex, not a numeric sequence — use timestamp as sequence
+            seq = ts
 
             book = self._books.get(token_id) or OrderBook(token_id=token_id)
             book.apply_snapshot(bids, asks, sequence=seq, timestamp_ms=ts)
@@ -81,8 +101,19 @@ class OrderBookManager:
 
     # -- WS message handling --------------------------------------------------
 
-    async def _handle_ws_message(self, msg: dict) -> None:
+    async def _handle_ws_message(self, msg: Any) -> None:
         """Route incoming WS messages to appropriate handlers."""
+        # WS can send batched messages as a list
+        if isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict):
+                    await self._handle_ws_message(item)
+            return
+
+        if not isinstance(msg, dict):
+            logger.debug("Skipping non-dict WS message: %s", type(msg).__name__)
+            return
+
         event_type = msg.get("event_type") or msg.get("type", "")
 
         if event_type in ("book", "book_update"):
@@ -112,26 +143,21 @@ class OrderBookManager:
             await self._fetch_snapshot(token_id)
             return
 
-        new_seq = int(msg.get("sequence", msg.get("hash", 0)) or 0)
-
-        # Gap detection
-        if new_seq > 0 and book.sequence > 0 and new_seq > book.sequence + 1:
-            logger.warning("Sequence gap for %s: expected %d, got %d — resyncing",
-                           token_id, book.sequence + 1, new_seq)
-            await self._fetch_snapshot(token_id)
-            return
-
         ts = int(msg.get("timestamp", 0) or 0)
+        # Use timestamp as sequence — hash field is hex, not numeric
+        new_seq = ts
 
         # Apply bid changes
         for change in msg.get("bids", []):
-            price, size = float(change[0]), float(change[1])
-            book.apply_delta(Side.BID, price, size, sequence=new_seq, timestamp_ms=ts)
+            change = _parse_book_level(change)
+            if change:
+                book.apply_delta(Side.BID, change[0], change[1], sequence=new_seq, timestamp_ms=ts)
 
         # Apply ask changes
         for change in msg.get("asks", []):
-            price, size = float(change[0]), float(change[1])
-            book.apply_delta(Side.ASK, price, size, sequence=new_seq, timestamp_ms=ts)
+            change = _parse_book_level(change)
+            if change:
+                book.apply_delta(Side.ASK, change[0], change[1], sequence=new_seq, timestamp_ms=ts)
 
         self._notify(token_id, book)
 
