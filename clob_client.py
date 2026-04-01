@@ -5,11 +5,12 @@ import enum
 import json
 import logging
 import time
-from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import aiohttp
 import websockets
+
+from config.settings import Settings, load_settings
 
 logger = logging.getLogger(__name__)
 
@@ -55,53 +56,29 @@ class ConnState(enum.Enum):
 
 
 # ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-@dataclass
-class CLOBConfig:
-    rest_url: str = "https://clob.polymarket.com"
-    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    api_key: Optional[str] = None
-    api_secret: Optional[str] = None
-    api_passphrase: Optional[str] = None
-    request_timeout: float = 10.0
-    max_retries: int = 5
-    base_backoff: float = 0.5
-    max_backoff: float = 30.0
-    heartbeat_interval: float = 30.0
-    rate_limit_per_second: int = 10
-
-    def validate(self) -> None:
-        if not self.rest_url:
-            raise CLOBConfigError("rest_url is required")
-        if not self.ws_url:
-            raise CLOBConfigError("ws_url is required")
-
-
-# ---------------------------------------------------------------------------
 # REST client
 # ---------------------------------------------------------------------------
 
 class CLOBRestClient:
     """Async REST client for Polymarket CLOB API."""
 
-    def __init__(self, config: CLOBConfig):
-        config.validate()
-        self._config = config
+    def __init__(self, settings: Settings):
+        self._settings = settings
+        self._api = settings.api
+        self._conn = settings.connection
         self._session: Optional[aiohttp.ClientSession] = None
         self._request_times: list[float] = []
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             headers: dict[str, str] = {"Content-Type": "application/json"}
-            if self._config.api_key:
-                headers["POLY_API_KEY"] = self._config.api_key
-            if self._config.api_secret:
-                headers["POLY_API_SECRET"] = self._config.api_secret
-            if self._config.api_passphrase:
-                headers["POLY_PASSPHRASE"] = self._config.api_passphrase
-            timeout = aiohttp.ClientTimeout(total=self._config.request_timeout)
+            if self._api.api_key:
+                headers["POLY_API_KEY"] = self._api.api_key
+            if self._api.api_secret:
+                headers["POLY_API_SECRET"] = self._api.api_secret
+            if self._api.api_passphrase:
+                headers["POLY_PASSPHRASE"] = self._api.api_passphrase
+            timeout = aiohttp.ClientTimeout(total=self._conn.request_timeout)
             self._session = aiohttp.ClientSession(headers=headers, timeout=timeout)
         return self._session
 
@@ -109,7 +86,7 @@ class CLOBRestClient:
         now = time.monotonic()
         window = 1.0
         self._request_times = [t for t in self._request_times if now - t < window]
-        if len(self._request_times) >= self._config.rate_limit_per_second:
+        if len(self._request_times) >= self._conn.rate_limit_per_second:
             sleep_for = window - (now - self._request_times[0])
             if sleep_for > 0:
                 logger.debug("Throttling for %.3fs", sleep_for)
@@ -124,17 +101,17 @@ class CLOBRestClient:
         body: Optional[dict] = None,
     ) -> Any:
         """Send an HTTP request with retries and exponential backoff."""
-        url = f"{self._config.rest_url}{path}"
+        url = f"{self._api.clob_rest_url}{path}"
         last_err: Optional[Exception] = None
 
-        for attempt in range(1, self._config.max_retries + 1):
+        for attempt in range(1, self._conn.max_retries + 1):
             await self._throttle()
             session = await self._ensure_session()
             try:
                 logger.debug("REQ %s %s attempt=%d", method, path, attempt)
                 async with session.request(method, url, params=params, json=body) as resp:
                     if resp.status == 429:
-                        retry_after = float(resp.headers.get("Retry-After", self._config.base_backoff * attempt))
+                        retry_after = float(resp.headers.get("Retry-After", self._conn.base_backoff * attempt))
                         logger.warning("Rate limited on %s %s, retry after %.1fs", method, path, retry_after)
                         await asyncio.sleep(retry_after)
                         last_err = CLOBRateLimitError(retry_after)
@@ -144,7 +121,7 @@ class CLOBRestClient:
                         text = await resp.text()
                         logger.warning("Server error %d on %s %s: %s", resp.status, method, path, text[:200])
                         last_err = CLOBConnectionError(f"HTTP {resp.status}: {text[:200]}")
-                        await asyncio.sleep(min(self._config.base_backoff * (2 ** (attempt - 1)), self._config.max_backoff))
+                        await asyncio.sleep(min(self._conn.base_backoff * (2 ** (attempt - 1)), self._conn.max_backoff))
                         continue
 
                     if resp.status >= 400:
@@ -155,13 +132,13 @@ class CLOBRestClient:
                     return data
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                backoff = min(self._config.base_backoff * (2 ** (attempt - 1)), self._config.max_backoff)
+                backoff = min(self._conn.base_backoff * (2 ** (attempt - 1)), self._conn.max_backoff)
                 logger.warning("Network error on %s %s (attempt %d/%d): %s — retrying in %.1fs",
-                               method, path, attempt, self._config.max_retries, exc, backoff)
+                               method, path, attempt, self._conn.max_retries, exc, backoff)
                 last_err = CLOBConnectionError(str(exc))
                 await asyncio.sleep(backoff)
 
-        raise CLOBConnectionError(f"All {self._config.max_retries} retries exhausted for {method} {path}") from last_err
+        raise CLOBConnectionError(f"All {self._conn.max_retries} retries exhausted for {method} {path}") from last_err
 
     # -- convenience helpers --------------------------------------------------
 
@@ -191,11 +168,12 @@ class CLOBWebSocketClient:
 
     def __init__(
         self,
-        config: CLOBConfig,
+        settings: Settings,
         on_message: Optional[Callable[[dict], Any]] = None,
     ):
-        config.validate()
-        self._config = config
+        self._settings = settings
+        self._api = settings.api
+        self._conn = settings.connection
         self._on_message = on_message
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._state = ConnState.DISCONNECTED
@@ -221,8 +199,8 @@ class CLOBWebSocketClient:
                 self._set_state(ConnState.CONNECTING)
                 attempt += 1
                 async with websockets.connect(
-                    self._config.ws_url,
-                    ping_interval=self._config.heartbeat_interval,
+                    self._api.clob_ws_url,
+                    ping_interval=self._conn.heartbeat_interval,
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
@@ -261,7 +239,7 @@ class CLOBWebSocketClient:
             if not self._running:
                 break
 
-            backoff = min(self._config.base_backoff * (2 ** attempt), self._config.max_backoff)
+            backoff = min(self._conn.base_backoff * (2 ** attempt), self._conn.max_backoff)
             logger.info("Reconnecting in %.1fs (attempt %d)", backoff, attempt)
             await asyncio.sleep(backoff)
 
