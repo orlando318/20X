@@ -116,67 +116,130 @@ class OrderBookManager:
 
         event_type = msg.get("event_type") or msg.get("type", "")
 
-        if event_type in ("book", "book_update"):
-            await self._handle_book_update(msg)
-        elif event_type == "book_snapshot":
-            self._handle_snapshot_message(msg)
-        elif event_type in ("trade", "last_trade_price"):
-            pass  # Trade events handled by a separate consumer if needed
+        if event_type == "book":
+            self._handle_book_snapshot(msg)
+        elif event_type == "price_change":
+            await self._handle_price_change(msg)
+        elif event_type == "last_trade_price":
+            await self._handle_trade(msg)
+        elif event_type == "best_bid_ask":
+            pass  # Informational only — full book is maintained via price_change
         else:
             logger.debug("Unhandled WS event: %s", event_type)
 
-    async def _handle_book_update(self, msg: dict) -> None:
-        """Apply an incremental book delta from WS."""
-        token_id = msg.get("asset_id") or msg.get("market", "")
+    def _handle_book_snapshot(self, msg: dict) -> None:
+        """Handle a full order book snapshot from WS (event_type: 'book')."""
+        token_id = msg.get("asset_id", "")
         if not token_id:
-            logger.warning("Book update missing asset_id: %s", msg)
             return
 
-        # Skip updates while syncing
-        if token_id in self._syncing:
+        bids = _parse_book_levels(msg.get("bids") or [])
+        asks = _parse_book_levels(msg.get("asks") or [])
+        ts = int(msg.get("timestamp", 0) or 0)
+
+        book = self._books.get(token_id) or OrderBook(token_id=token_id)
+        book.apply_snapshot(bids, asks, sequence=ts, timestamp_ms=ts)
+        self._books[token_id] = book
+
+        logger.info("WS snapshot for %s: %d bids, %d asks", token_id[:16], len(book.bids), len(book.asks))
+        self._notify(token_id, book)
+
+    async def _handle_price_change(self, msg: dict) -> None:
+        """Handle price_change events — individual level updates.
+
+        Format:
+            {
+                "event_type": "price_change",
+                "market": "<condition_id>",
+                "price_changes": [
+                    {"asset_id": "...", "price": "0.5", "size": "200", "side": "BUY", ...},
+                    ...
+                ],
+                "timestamp": "1757908892351"
+            }
+        """
+        ts = int(msg.get("timestamp", 0) or 0)
+        changes = msg.get("price_changes") or []
+
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+
+            token_id = change.get("asset_id", "")
+            if not token_id or token_id in self._syncing:
+                continue
+
+            book = self._books.get(token_id)
+            if book is None:
+                await self._fetch_snapshot(token_id)
+                continue
+
+            price = float(change.get("price", 0))
+            size = float(change.get("size", 0))
+            raw_side = change.get("side", "").upper()
+
+            if raw_side == "BUY":
+                side = Side.BID
+            elif raw_side == "SELL":
+                side = Side.ASK
+            else:
+                continue
+
+            book.apply_delta(side, price, size, sequence=ts, timestamp_ms=ts)
+            self._notify(token_id, book)
+
+    async def _handle_trade(self, msg: dict) -> None:
+        """Handle last_trade_price — reduce liquidity at the traded price level.
+
+        Format:
+            {
+                "event_type": "last_trade_price",
+                "asset_id": "...",
+                "price": "0.456",
+                "size": "219.217767",
+                "side": "BUY",  // taker side
+                "timestamp": "1750428146322"
+            }
+
+        A BUY taker consumes ASK liquidity. A SELL taker consumes BID liquidity.
+        """
+        token_id = msg.get("asset_id", "")
+        if not token_id or token_id in self._syncing:
             return
 
         book = self._books.get(token_id)
         if book is None:
-            # No snapshot yet — fetch one
-            logger.info("No book for %s, fetching snapshot", token_id)
-            await self._fetch_snapshot(token_id)
             return
 
+        trade_price = float(msg.get("price", 0))
+        trade_size = float(msg.get("size", 0))
+        raw_side = msg.get("side", "").upper()
         ts = int(msg.get("timestamp", 0) or 0)
-        # Use timestamp as sequence — hash field is hex, not numeric
-        new_seq = ts
 
-        # Apply bid changes
-        for change in msg.get("bids", []):
-            change = _parse_book_level(change)
-            if change:
-                book.apply_delta(Side.BID, change[0], change[1], sequence=new_seq, timestamp_ms=ts)
-
-        # Apply ask changes
-        for change in msg.get("asks", []):
-            change = _parse_book_level(change)
-            if change:
-                book.apply_delta(Side.ASK, change[0], change[1], sequence=new_seq, timestamp_ms=ts)
-
-        self._notify(token_id, book)
-
-    def _handle_snapshot_message(self, msg: dict) -> None:
-        """Handle a full snapshot delivered over WS."""
-        token_id = msg.get("asset_id") or msg.get("market", "")
-        if not token_id:
+        if not trade_price or not trade_size:
             return
 
-        bids = [[float(p), float(s)] for p, s in (msg.get("bids") or [])]
-        asks = [[float(p), float(s)] for p, s in (msg.get("asks") or [])]
-        seq = int(msg.get("sequence", msg.get("hash", 0)) or 0)
-        ts = int(msg.get("timestamp", 0) or 0)
+        # Taker BUY consumes ASK side, taker SELL consumes BID side
+        if raw_side == "BUY":
+            levels = book.asks
+        elif raw_side == "SELL":
+            levels = book.bids
+        else:
+            return
 
-        book = self._books.get(token_id) or OrderBook(token_id=token_id)
-        book.apply_snapshot(bids, asks, sequence=seq, timestamp_ms=ts)
-        self._books[token_id] = book
+        # Find and reduce the level at the trade price.
+        # If trade_size >= level size, the trade swept through this level
+        # entirely (and possibly others). Remove it — price_change messages
+        # will correct adjacent levels.
+        for level in levels:
+            if level.price == trade_price:
+                if trade_size >= level.size:
+                    levels.remove(level)
+                else:
+                    level.size = round(level.size - trade_size, 8)
+                break
 
-        logger.info("WS snapshot for %s: %d bids, %d asks", token_id, len(book.bids), len(book.asks))
+        book.timestamp_ms = ts
         self._notify(token_id, book)
 
     # -- Listener notification ------------------------------------------------

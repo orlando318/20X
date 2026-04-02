@@ -94,6 +94,7 @@ class CryptoMarket(Market):
 
     coin: Coin
     duration: Duration
+    slug: str = ""
     instruments: list[Instrument] = []
     start_date: Optional[datetime] = None
 

@@ -609,6 +609,7 @@ class CryptoMarketSelector:
                 if raw:
                     market = _parse_gamma_market(raw, coin, duration)
                     if market:
+                        market.slug = slug
                         results.append(market)
                         logger.info("Found %s %s market: %s", coin.value, duration.value, slug)
                         return
@@ -619,6 +620,7 @@ class CryptoMarketSelector:
                     if raw:
                         market = _parse_gamma_event(raw, coin, duration)
                         if market:
+                            market.slug = slug
                             results.append(market)
                             logger.info("Found %s %s event: %s", coin.value, duration.value, slug)
                             return
