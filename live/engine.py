@@ -141,10 +141,14 @@ class LiveEngine:
         hour_et: Optional[int] = None,
     ) -> None:
         """Discover market, fetch snapshots, connect WS, and start streaming."""
-        # 1. Discover
         logger.info("Discovering %s %s market...", coin.value, duration.value)
-        self._market = await self._discover(coin, duration, timestamp, hour_et)
-        logger.info("Found: %s (%d instruments)", self._market.question, len(self._market.instruments))
+        market = await self._discover(coin, duration, timestamp, hour_et)
+        await self.start_with_market(market)
+
+    async def start_with_market(self, market: CryptoMarket) -> None:
+        """Start with a pre-discovered market. Use this to avoid re-discovery."""
+        self._market = market
+        logger.info("Starting with: %s (%d instruments)", self._market.question, len(self._market.instruments))
 
         if not self._market.instruments:
             raise RuntimeError("Market has no instruments")

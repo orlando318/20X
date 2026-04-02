@@ -97,6 +97,7 @@ class CryptoMarket(Market):
     slug: str = ""
     instruments: list[Instrument] = []
     start_date: Optional[datetime] = None
+    event_start_time: Optional[datetime] = None  # when the candle/window opens (for up/down markets)
 
     @computed_field
     @property

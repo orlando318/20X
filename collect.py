@@ -68,18 +68,12 @@ async def discover_market(
     timestamp: Optional[int] = None, hour_et: Optional[int] = None,
 ) -> CryptoMarket:
     if duration == Duration.MIN_5:
-        if not timestamp:
-            raise SystemExit("--timestamp required for 5m markets")
         markets = await selector.fetch_5m([coin], timestamp)
     elif duration == Duration.MIN_15:
-        if not timestamp:
-            raise SystemExit("--timestamp required for 15m markets")
         markets = await selector.fetch_15m([coin], timestamp)
     elif duration == Duration.HOUR_1:
         markets = await selector.fetch_1h([coin], hour_et=hour_et)
     elif duration == Duration.HOUR_4:
-        if not timestamp:
-            raise SystemExit("--timestamp required for 4h markets")
         markets = await selector.fetch_4h([coin], timestamp)
     elif duration == Duration.DAILY:
         markets = await selector.fetch_daily([coin])

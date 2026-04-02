@@ -24,10 +24,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+import aiohttp
 import websockets
 
 logger = logging.getLogger(__name__)
 
+REST_BASE = "https://api.binance.com"
 WS_BASE = "wss://stream.binance.com:9443/ws"
 WS_COMBINED = "wss://stream.binance.com:9443/stream"
 
@@ -252,3 +254,60 @@ class BinanceFeed:
                     cb(trade)
                 except Exception:
                     logger.exception("Error in Binance trade listener")
+
+
+# ---------------------------------------------------------------------------
+# REST helpers
+# ---------------------------------------------------------------------------
+
+async def fetch_candle_open(pair: str, start_time_ms: int, interval: str = "1m") -> Optional[float]:
+    """Fetch the open price of a Binance kline at a specific time.
+
+    Args:
+        pair: e.g. "BTCUSDT"
+        start_time_ms: Unix ms of candle open
+        interval: Binance kline interval ("1m", "5m", "15m", "1h", "4h")
+
+    Returns:
+        Open price as float, or None on failure.
+    """
+    url = f"{REST_BASE}/api/v3/klines"
+    params = {
+        "symbol": pair,
+        "interval": interval,
+        "startTime": str(start_time_ms),
+        "limit": "1",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if data and len(data) > 0:
+                    # Kline format: [open_time, open, high, low, close, ...]
+                    return float(data[0][1])
+    except Exception as exc:
+        logger.warning("Failed to fetch Binance candle: %s", exc)
+    return None
+
+
+async def fetch_reference_price(pair: str, event_start_time_ms: int, duration_minutes: int) -> Optional[float]:
+    """Get the Binance open price for an up/down market's reference candle.
+
+    Picks the appropriate Binance kline interval based on market duration,
+    then fetches the open price at the event start time.
+    """
+    # Map market duration to Binance interval
+    if duration_minutes <= 5:
+        interval = "1m"
+    elif duration_minutes <= 15:
+        interval = "5m"
+    elif duration_minutes <= 60:
+        interval = "1h"
+    elif duration_minutes <= 240:
+        interval = "4h"
+    else:
+        interval = "1d"
+
+    return await fetch_candle_open(pair, event_start_time_ms, interval)

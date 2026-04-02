@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -330,6 +331,7 @@ def _parse_gamma_market(raw: dict, coin: Coin, duration: Duration) -> Optional[C
             duration=duration,
             instruments=instruments,
             start_date=_parse_dt(raw.get("startDate") or raw.get("created_at")),
+            event_start_time=_parse_dt(raw.get("eventStartTime")),
         )
     except Exception as exc:
         logger.debug("Failed to parse gamma market: %s", exc)
@@ -492,17 +494,23 @@ class CryptoMarketSelector:
             try_events=True,
         )
 
-    async def fetch_5m(self, coins: list[Coin], end_timestamp: int) -> list[CryptoMarket]:
-        """Fetch 5-minute markets by end timestamp (unix seconds)."""
+    async def fetch_5m(self, coins: list[Coin], slug_timestamp: Optional[int] = None) -> list[CryptoMarket]:
+        """Fetch 5-minute markets. Auto-detects current window if no timestamp given."""
+        if slug_timestamp is None:
+            now = int(time.time())
+            slug_timestamp = now - (now % 300)  # current 5-min boundary
         return await self._fetch_by_slugs(
-            {coin: build_short_duration_slugs(coin, Duration.MIN_5, end_timestamp) for coin in coins},
+            {coin: build_short_duration_slugs(coin, Duration.MIN_5, slug_timestamp) for coin in coins},
             Duration.MIN_5,
         )
 
-    async def fetch_15m(self, coins: list[Coin], end_timestamp: int) -> list[CryptoMarket]:
-        """Fetch 15-minute markets by end timestamp (unix seconds)."""
+    async def fetch_15m(self, coins: list[Coin], slug_timestamp: Optional[int] = None) -> list[CryptoMarket]:
+        """Fetch 15-minute markets. Auto-detects current window if no timestamp given."""
+        if slug_timestamp is None:
+            now = int(time.time())
+            slug_timestamp = now - (now % 900)  # current 15-min boundary
         return await self._fetch_by_slugs(
-            {coin: build_short_duration_slugs(coin, Duration.MIN_15, end_timestamp) for coin in coins},
+            {coin: build_short_duration_slugs(coin, Duration.MIN_15, slug_timestamp) for coin in coins},
             Duration.MIN_15,
         )
 
@@ -522,10 +530,13 @@ class CryptoMarketSelector:
             Duration.HOUR_1,
         )
 
-    async def fetch_4h(self, coins: list[Coin], end_timestamp: int) -> list[CryptoMarket]:
-        """Fetch 4-hour markets by end timestamp (unix seconds)."""
+    async def fetch_4h(self, coins: list[Coin], slug_timestamp: Optional[int] = None) -> list[CryptoMarket]:
+        """Fetch 4-hour markets. Auto-detects current window if no timestamp given."""
+        if slug_timestamp is None:
+            now = int(time.time())
+            slug_timestamp = now - (now % 14400)  # current 4h boundary
         return await self._fetch_by_slugs(
-            {coin: build_short_duration_slugs(coin, Duration.HOUR_4, end_timestamp) for coin in coins},
+            {coin: build_short_duration_slugs(coin, Duration.HOUR_4, slug_timestamp) for coin in coins},
             Duration.HOUR_4,
         )
 
