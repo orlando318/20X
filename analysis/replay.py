@@ -175,22 +175,25 @@ def _apply_message(
         ts = int(msg.get("timestamp", 0) or 0)
 
         if raw_side == "BUY":
-            target_levels = book.asks
+            book.reduce_level(Side.ASK, trade_price, trade_size)
         elif raw_side == "SELL":
-            target_levels = book.bids
+            book.reduce_level(Side.BID, trade_price, trade_size)
         else:
             return []
 
-        for level in target_levels:
-            if level.price == trade_price:
-                if trade_size >= level.size:
-                    target_levels.remove(level)
-                else:
-                    level.size = round(level.size - trade_size, 8)
-                break
-
         book.timestamp_ms = ts
         updated.append(token_id)
+
+    elif event_type == "tick_size_change":
+        asset_id = msg.get("asset_id", "")
+        new_tick = msg.get("tick_size") or msg.get("new_tick_size")
+        if asset_id and new_tick:
+            if token_filter and not asset_id.startswith(token_filter):
+                return []
+            book = books.get(asset_id)
+            if book:
+                book.set_tick_size(float(new_tick))
+                updated.append(asset_id)
 
     return updated
 

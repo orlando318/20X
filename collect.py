@@ -144,8 +144,15 @@ async def main():
     if not market.instruments:
         raise SystemExit("Market has no instruments — nothing to collect")
 
-    yes_token_ids = [inst.yes_token_id for inst in market.instruments]
-    logger.info("Subscribing to %d tokens", len(yes_token_ids))
+    # Subscribe to both YES and NO tokens for full book depth
+    all_token_ids = []
+    for inst in market.instruments:
+        all_token_ids.append(inst.yes_token_id)
+        if inst.no_token_id:
+            all_token_ids.append(inst.no_token_id)
+    logger.info("Subscribing to %d tokens (%d YES + %d NO)",
+                len(all_token_ids), len(market.instruments),
+                len(all_token_ids) - len(market.instruments))
 
     # 2. Set up collector
     collector = RawMessageCollector(market.slug, store, flush_every=args.flush_every)
@@ -170,7 +177,7 @@ async def main():
         try:
             attempt += 1
             async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as ws:
-                await ws.send(json.dumps({"assets_ids": yes_token_ids, "type": "market"}))
+                await ws.send(json.dumps({"assets_ids": all_token_ids, "type": "market"}))
                 logger.info("WebSocket connected, streaming...")
                 attempt = 0
 
